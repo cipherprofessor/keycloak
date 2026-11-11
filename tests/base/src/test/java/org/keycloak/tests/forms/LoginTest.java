@@ -17,6 +17,7 @@
 package org.keycloak.tests.forms;
 
 import java.io.IOException;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -34,12 +35,14 @@ import org.keycloak.events.Details;
 import org.keycloak.events.Errors;
 import org.keycloak.events.EventType;
 import org.keycloak.models.BrowserSecurityHeaders;
+import org.keycloak.models.Constants;
 import org.keycloak.models.RealmModel;
 import org.keycloak.models.UserModel.RequiredAction;
 import org.keycloak.representations.idm.ClientRepresentation;
 import org.keycloak.representations.idm.ClientScopeRepresentation;
 import org.keycloak.representations.idm.EventRepresentation;
 import org.keycloak.services.managers.AuthenticationSessionManager;
+import org.keycloak.services.resources.LoginActionsService;
 import org.keycloak.services.validation.Validation;
 import org.keycloak.sessions.RootAuthenticationSessionModel;
 import org.keycloak.testframework.annotations.InjectEvents;
@@ -85,6 +88,7 @@ import org.apache.http.client.entity.UrlEncodedFormEntity;
 import org.apache.http.client.methods.CloseableHttpResponse;
 import org.apache.http.client.methods.HttpGet;
 import org.apache.http.client.methods.HttpPost;
+import org.apache.http.client.utils.URLEncodedUtils;
 import org.apache.http.impl.client.CloseableHttpClient;
 import org.apache.http.message.BasicNameValuePair;
 import org.apache.http.util.EntityUtils;
@@ -1116,6 +1120,50 @@ public class LoginTest {
         runOnServer.run(session-> {
             RealmModel realm = session.realms().getRealm(managedRealmId);
             assertNotNull(session.authenticationSessions().getRootAuthenticationSession(realm, authSessionId));
+        });
+    }
+
+    @Test
+    public void testAuthSessionIdParamSignedInRequiredActionRedirect() {
+        oauth.openLoginForm();
+        String encodedBase64AuthSessionId = driver.driver().manage().getCookieNamed(CookieType.AUTH_SESSION_ID.getName()).getValue();
+        String decodedAuthSessionId = new String(Base64Url.decode(encodedBase64AuthSessionId), StandardCharsets.UTF_8);
+        String authSessionId = decodedAuthSessionId.substring(0, decodedAuthSessionId.indexOf("."));
+
+        // Reload the login form with the signed auth_session_id request parameter, as a refresh URL created by
+        // AuthenticationFlowContext.getRefreshUrl(true) does, so that it is propagated to the subsequent requests
+        String formAction = driver.driver().findElement(By.id("kc-form-login")).getAttribute("action");
+        Map<String, String> formParams = new HashMap<>();
+        URLEncodedUtils.parse(URI.create(formAction), StandardCharsets.UTF_8).forEach(p -> formParams.put(p.getName(), p.getValue()));
+        driver.open(keycloakUrls.getBaseBuilder()
+                .path("realms/{realm}/login-actions/authenticate")
+                .queryParam(Constants.CLIENT_ID, formParams.get(Constants.CLIENT_ID))
+                .queryParam(Constants.TAB_ID, formParams.get(Constants.TAB_ID))
+                .queryParam(Constants.CLIENT_DATA, formParams.get(Constants.CLIENT_DATA))
+                .queryParam(LoginActionsService.AUTH_SESSION_ID, encodedBase64AuthSessionId)
+                .buildAsString(managedRealm.getName()));
+        loginPage.assertCurrent();
+
+        // keycloak-user@localhost has UPDATE_PASSWORD required action, so the login redirects to the required action
+        loginPage.fillLogin("keycloak-user@localhost", getPassword("keycloak-user@localhost"));
+        loginPage.submit();
+        updatePasswordPage.assertCurrent();
+
+        URI requiredActionUri = URI.create(driver.getCurrentUrl());
+        assertThat(requiredActionUri.getPath(), containsString("/login-actions/required-action"));
+        String authSessionIdParam = URLEncodedUtils.parse(requiredActionUri, StandardCharsets.UTF_8).stream()
+                .filter(p -> LoginActionsService.AUTH_SESSION_ID.equals(p.getName()))
+                .map(NameValuePair::getValue)
+                .findFirst()
+                .orElse(null);
+        assertNotNull(authSessionIdParam);
+        assertNotEquals(authSessionId, authSessionIdParam, "auth_session_id request parameter must not be the raw auth session id");
+
+        var managedRealmId = managedRealm.getId();
+        runOnServer.run(session -> {
+            RealmModel realm = session.realms().getRealm(managedRealmId);
+            session.getContext().setRealm(realm);
+            assertEquals(authSessionId, new AuthenticationSessionManager(session).decodeBase64AndValidateSignature(authSessionIdParam));
         });
     }
 
